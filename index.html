@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Air Drawing</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{background:#000;overflow:hidden;height:100vh;width:100vw;font-family:'Inter',sans-serif}
+
+        /* Full screen canvas stack */
+        #wrap{position:relative;width:100vw;height:100vh}
+        video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);opacity:.15;z-index:1}
+        canvas{position:absolute;top:0;left:0;width:100%;height:100%}
+        #draw-layer{z-index:2}
+        #hand-layer{z-index:3;pointer-events:none}
+        #fx-layer{z-index:4;pointer-events:none}
+
+        /* Minimal floating controls — bottom right */
+        .controls{position:fixed;bottom:20px;right:20px;z-index:50;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+        .ctrl-row{display:flex;gap:6px;align-items:center}
+        .pill{padding:6px 14px;border-radius:20px;background:rgba(255,255,255,.08);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.1);color:rgba(255,255,255,.7);font:500 11px 'Inter',sans-serif;cursor:pointer;transition:all .15s;user-select:none}
+        .pill:hover{background:rgba(255,255,255,.14);color:#fff}
+        .pill.active{background:rgba(0,240,255,.12);color:#00f0ff;border-color:rgba(0,240,255,.3)}
+
+        /* Color dots */
+        .cdot{width:20px;height:20px;border-radius:50%;cursor:pointer;border:2px solid transparent;transition:all .15s}
+        .cdot:hover{transform:scale(1.2)}
+        .cdot.on{border-color:#fff;box-shadow:0 0 10px currentColor}
+
+        /* Status indicator — top left, very subtle */
+        #status{position:fixed;top:16px;left:16px;z-index:50;display:flex;align-items:center;gap:6px;font:500 11px 'Inter',sans-serif;color:rgba(255,255,255,.4)}
+        #status .dot{width:6px;height:6px;border-radius:50%;background:#333}
+
+        /* Splash */
+        #splash{position:fixed;inset:0;z-index:999;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;transition:opacity .5s}
+        #splash.gone{opacity:0;pointer-events:none}
+        #splash h1{font:600 28px 'Inter',sans-serif;color:#00f0ff;letter-spacing:1px}
+        #splash p{color:rgba(255,255,255,.35);font-size:13px}
+        .loader{margin-top:14px;width:120px;height:2px;border-radius:1px;background:rgba(255,255,255,.06);overflow:hidden}
+        .loader-bar{width:0;height:100%;background:#00f0ff;transition:width .3s}
+        #splash .sub{color:rgba(255,255,255,.3);font-size:10px;margin-top:4px}
+    </style>
+</head>
+<body>
+
+<!-- Splash -->
+<div id="splash">
+    <h1>AIR DRAW</h1>
+    <p>Point to draw · Pinch to grab</p>
+    <div class="loader"><div class="loader-bar" id="lbar"></div></div>
+    <div class="sub" id="lstatus">Loading...</div>
+</div>
+
+<!-- Canvas stack -->
+<div id="wrap">
+    <video id="cam" playsinline></video>
+    <canvas id="draw-layer"></canvas>
+    <canvas id="hand-layer"></canvas>
+    <canvas id="fx-layer"></canvas>
+</div>
+
+<!-- Tiny status (top-left) -->
+<div id="status">
+    <div class="dot" id="sdot"></div>
+    <span id="slabel">—</span>
+</div>
+
+<!-- Minimal controls (bottom-right) -->
+<div class="controls">
+    <div class="ctrl-row">
+        <div class="cdot on" data-c="#00f0ff"></div>
+        <div class="cdot" data-c="#ff3366"></div>
+        <div class="cdot" data-c="#39ff8e"></div>
+        <div class="cdot" data-c="#ffe744"></div>
+        <div class="cdot" data-c="#ff44cc"></div>
+        <div class="cdot" data-c="#fff"></div>
+    </div>
+    <div class="ctrl-row">
+        <span class="pill" id="btnUndo">Undo</span>
+        <span class="pill" id="btnClear">Clear</span>
+        <span class="pill" id="btnSave">Save</span>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<script>
+(function(){
+    const $=id=>document.getElementById(id);
+    const cam=$('cam');
+    const dCv=$('draw-layer'), hCv=$('hand-layer'), fCv=$('fx-layer');
+    const dC=dCv.getContext('2d'), hC=hCv.getContext('2d'), fC=fCv.getContext('2d');
+
+    let W=innerWidth, H=innerHeight;
+    let color='#00f0ff', brush=3;
+
+    // Drawing state — midpoint bezier (professional smooth drawing)
+    let lastPt=null, lastMid=null, wasDrawing=false, strokes=0;
+    let drawExitCount=0;     // debounce: frames since last draw gesture
+    const DRAW_EXIT_FRAMES=4; // need this many non-draw frames to actually stop
+
+    // Grab state
+    let grabbing=false, pinch=false, wasPinch=false;
+    let grabAnchorX=0, grabAnchorY=0;
+    let drawOffX=0, drawOffY=0, grabStartOX=0, grabStartOY=0;
+
+    // Offscreen canvas (stores the actual drawing)
+    let off, offC;
+    function initOff(){
+        off=document.createElement('canvas');
+        off.width=W; off.height=H;
+        offC=off.getContext('2d');
+    }
+    function composite(){
+        dC.clearRect(0,0,W,H);
+        dC.drawImage(off, drawOffX, drawOffY);
+    }
+
+    // Undo
+    const undos=[]; const MAX_UNDO=20;
+    function pushUndo(){
+        const s=document.createElement('canvas');
+        s.width=W; s.height=H;
+        s.getContext('2d').drawImage(off,0,0);
+        undos.push({cv:s,ox:drawOffX,oy:drawOffY});
+        if(undos.length>MAX_UNDO) undos.shift();
+    }
+    function popUndo(){
+        if(!undos.length)return;
+        const s=undos.pop();
+        offC.clearRect(0,0,W,H);
+        offC.drawImage(s.cv,0,0);
+        drawOffX=s.ox; drawOffY=s.oy;
+        composite();
+    }
+
+    // Particles
+    const parts=[];
+    function spark(x,y,c,n){
+        for(let i=0;i<n&&parts.length<60;i++){
+            const a=Math.random()*Math.PI*2, sp=.6+Math.random()*2.5;
+            parts.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp-.8,
+                life:.25+Math.random()*.35,max:.25+Math.random()*.35,
+                c,r:1+Math.random()*2});
+        }
+    }
+
+    // Double smoothing — two-pass EMA for ultra-smooth cursor
+    let sx=null, sy=null;   // first pass
+    let sx2=null, sy2=null; // second pass
+    const SM1=0.45; // first EMA
+    const SM2=0.35; // second EMA (smooths the smoothed)
+    const MIN_DIST=3; // minimum px to move before adding a point
+
+    // Resize
+    function resize(){
+        W=innerWidth; H=innerHeight;
+        const oldOff=off, oox=drawOffX, ooy=drawOffY;
+        dCv.width=W;dCv.height=H;hCv.width=W;hCv.height=H;fCv.width=W;fCv.height=H;
+        initOff();
+        if(oldOff){offC.drawImage(oldOff,0,0);drawOffX=oox;drawOffY=ooy;}
+        composite();
+    }
+    addEventListener('resize',resize);
+    dCv.width=W;dCv.height=H;hCv.width=W;hCv.height=H;fCv.width=W;fCv.height=H;
+    initOff();
+
+    // ═══════════════════════════════════════════════════════
+    // HAND SKELETON — bright neon wireframe like the reel
+    // ═══════════════════════════════════════════════════════
+    const CONNS=[
+        [0,1],[1,2],[2,3],[3,4],        // thumb
+        [0,5],[5,6],[6,7],[7,8],        // index
+        [5,9],[9,10],[10,11],[11,12],   // middle
+        [9,13],[13,14],[14,15],[15,16], // ring
+        [13,17],[17,18],[18,19],[19,20],// pinky
+        [0,17]                          // palm base
+    ];
+
+    function drawHand(lm){
+        hC.clearRect(0,0,W,H);
+        const pts=lm.map(l=>({x:(1-l.x)*W, y:l.y*H}));
+
+        // Draw all bones — consistent cyan color for clean look
+        hC.save();
+        hC.strokeStyle='#00e5ff';
+        hC.lineWidth=2.5;
+        hC.shadowColor='#00e5ff';
+        hC.shadowBlur=10;
+        hC.globalAlpha=0.85;
+
+        for(const[a,b]of CONNS){
+            hC.beginPath();
+            hC.moveTo(pts[a].x, pts[a].y);
+            hC.lineTo(pts[b].x, pts[b].y);
+            hC.stroke();
+        }
+        hC.restore();
+
+        // Landmark dots
+        for(let i=0;i<pts.length;i++){
+            const isTip=[4,8,12,16,20].includes(i);
+            hC.save();
+            hC.fillStyle=isTip?'#fff':'#00e5ff';
+            hC.shadowColor='#00e5ff';
+            hC.shadowBlur=isTip?14:5;
+            hC.globalAlpha=isTip?1:0.7;
+            hC.beginPath();
+            hC.arc(pts[i].x, pts[i].y, isTip?5:3, 0, Math.PI*2);
+            hC.fill();
+            hC.restore();
+        }
+
+        // Extra bright glow on INDEX TIP — the drawing finger
+        hC.save();
+        hC.fillStyle='#fff';
+        hC.shadowColor='#00f0ff';
+        hC.shadowBlur=20;
+        hC.globalAlpha=0.9;
+        hC.beginPath();
+        hC.arc(pts[8].x, pts[8].y, 6, 0, Math.PI*2);
+        hC.fill();
+        hC.restore();
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // NEON STROKE — draws one bezier segment at a time
+    // ═══════════════════════════════════════════════════════
+    function neonSegment(ctx, fromX, fromY, cpX, cpY, toX, toY){
+        ctx.save();
+        ctx.lineCap=ctx.lineJoin='round';
+
+        function trace(){
+            ctx.beginPath();
+            ctx.moveTo(fromX, fromY);
+            ctx.quadraticCurveTo(cpX, cpY, toX, toY);
+        }
+
+        // Outer glow
+        ctx.strokeStyle=color;
+        ctx.shadowColor=color;
+        ctx.shadowBlur=16;
+        ctx.globalAlpha=0.3;
+        ctx.lineWidth=brush*2.5;
+        trace(); ctx.stroke();
+
+        // Mid glow
+        ctx.shadowBlur=6;
+        ctx.globalAlpha=0.6;
+        ctx.lineWidth=brush*1.4;
+        trace(); ctx.stroke();
+
+        // Solid core
+        ctx.shadowBlur=2;
+        ctx.globalAlpha=1;
+        ctx.lineWidth=Math.max(1.5, brush);
+        trace(); ctx.stroke();
+
+        // White center
+        ctx.shadowBlur=0;
+        ctx.globalAlpha=0.7;
+        ctx.strokeStyle='#fff';
+        ctx.lineWidth=Math.max(0.5, brush*0.25);
+        trace(); ctx.stroke();
+
+        ctx.restore();
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // FX LOOP — particles
+    // ═══════════════════════════════════════════════════════
+    let lt=performance.now();
+    function fxLoop(){
+        const now=performance.now(), dt=(now-lt)/1000; lt=now;
+        fC.clearRect(0,0,W,H);
+
+        for(let i=parts.length-1;i>=0;i--){
+            const p=parts[i];
+            p.life-=dt;
+            if(p.life<=0){parts.splice(i,1);continue;}
+            p.x+=p.vx; p.y+=p.vy; p.vy+=2*dt;
+        }
+        for(const p of parts){
+            const a=p.life/p.max;
+            fC.save();
+            fC.globalAlpha=a;
+            fC.fillStyle=p.c;
+            fC.shadowColor=p.c;
+            fC.shadowBlur=6;
+            fC.beginPath();
+            fC.arc(p.x,p.y, p.r*a, 0, Math.PI*2);
+            fC.fill();
+            // Also draw a tiny white center for sparkle
+            fC.fillStyle='#fff';
+            fC.shadowBlur=0;
+            fC.globalAlpha=a*0.6;
+            fC.beginPath();
+            fC.arc(p.x,p.y, p.r*a*0.3, 0, Math.PI*2);
+            fC.fill();
+            fC.restore();
+        }
+
+        requestAnimationFrame(fxLoop);
+    }
+    requestAnimationFrame(fxLoop);
+
+    // ═══════════════════════════════════════════════════════
+    // GESTURE DETECTION — simple and responsive
+    // ═══════════════════════════════════════════════════════
+    const PINCH_TH=50;
+    let pSmooth=0;
+
+    function onResults(res){
+        const dot=$('sdot'), lbl=$('slabel');
+
+        if(!res.multiHandLandmarks||!res.multiHandLandmarks.length){
+            dot.style.background='#333';
+            lbl.textContent='No hand';
+            hC.clearRect(0,0,W,H);
+            if(grabbing){grabbing=false; composite();}
+            if(wasDrawing){wasDrawing=false; lastPt=null; lastMid=null;}
+            pinch=false; wasPinch=false; sx=null; sy=null;
+            return;
+        }
+
+        const lm=res.multiHandLandmarks[0];
+
+        // Always draw the hand skeleton
+        drawHand(lm);
+
+        // ── Finger states ────────────────────────────
+        // tip.y must be clearly above mcp.y (0.04 dead zone prevents false triggers)
+        const indexUp  = lm[8].y < lm[5].y - 0.04;
+        const middleUp = lm[12].y < lm[9].y - 0.04;
+
+        // ── Pinch: thumb close to index ──────────────
+        const t4=lm[4], t8=lm[8];
+        const dx=(t4.x-t8.x)*W, dy=(t4.y-t8.y)*H;
+        const dist=Math.sqrt(dx*dx+dy*dy);
+        pSmooth = dist<PINCH_TH ? Math.min(1,pSmooth+.4) : Math.max(0,pSmooth-.3);
+        pinch = pSmooth>.5;
+
+        // ── Cursor: double-smoothed position ─────────
+        const rawX=(1-t8.x)*W, rawY=t8.y*H;
+        // First EMA pass
+        if(sx===null){sx=rawX;sy=rawY;sx2=rawX;sy2=rawY;}
+        else{
+            sx=SM1*sx+(1-SM1)*rawX; sy=SM1*sy+(1-SM1)*rawY;
+            // Second EMA pass on the already-smoothed value
+            sx2=SM2*sx2+(1-SM2)*sx; sy2=SM2*sy2+(1-SM2)*sy;
+        }
+        const x=sx2, y=sy2;
+
+        // ── Determine gesture ────────────────────────
+        // Pinch = GRAB & MOVE
+        // Index only = DRAW
+        // Index+Middle = HOVER
+        // Else = IDLE
+        let gesture;
+        if(pinch){
+            gesture='grab';
+        } else if(indexUp && !middleUp){
+            gesture='draw';
+        } else if(indexUp && middleUp){
+            gesture='hover';
+        } else {
+            gesture='idle';
+        }
+
+        // Status
+        const colors={draw:'#ff3366',hover:'#00f0ff',grab:'#ffe744',idle:'#444'};
+        const labels={draw:'Drawing',hover:'Hover',grab:'Moving',idle:'Ready'};
+        dot.style.background=colors[gesture];
+        lbl.textContent=labels[gesture];
+
+        // ═══════════════════════════════════════════════
+        // DRAW — midpoint bezier (ultra smooth + debounced exit)
+        // ═══════════════════════════════════════════════
+
+        // If currently in draw gesture, reset exit counter
+        if(gesture==='draw'){
+            drawExitCount=0;
+        } else if(wasDrawing){
+            // Not draw gesture but was drawing — count frames before stopping
+            drawExitCount++;
+        }
+
+        // Determine if we should actually be drawing
+        // (either gesture is draw, OR we were drawing and haven't hit exit threshold)
+        const shouldDraw = gesture==='draw' || (wasDrawing && drawExitCount < DRAW_EXIT_FRAMES);
+
+        if(shouldDraw){
+            if(!wasDrawing){ pushUndo(); strokes++; lastPt=null; lastMid=null; }
+            const cx=x-drawOffX, cy=y-drawOffY;
+
+            if(lastPt===null){
+                // First point of stroke
+                lastPt={x:cx,y:cy};
+                lastMid={x:cx,y:cy};
+            } else {
+                // Check minimum distance to avoid jitter dots
+                const ddx=cx-lastPt.x, ddy=cy-lastPt.y;
+                if(ddx*ddx+ddy*ddy >= MIN_DIST*MIN_DIST){
+                    // Calculate midpoint between last point and current
+                    const mid={x:(lastPt.x+cx)/2, y:(lastPt.y+cy)/2};
+
+                    // Draw bezier from lastMid → mid, using lastPt as control
+                    neonSegment(offC,
+                        lastMid.x, lastMid.y,
+                        lastPt.x, lastPt.y,
+                        mid.x, mid.y
+                    );
+
+                    lastMid=mid;
+                    lastPt={x:cx,y:cy};
+                }
+            }
+
+            composite();
+            spark(x, y, color, 3);
+            spark(x, y, '#fff', 1);
+            wasDrawing=true;
+        } else {
+            if(wasDrawing){lastPt=null; lastMid=null; wasDrawing=false; drawExitCount=0;}
+        }
+
+        // ═══════════════════════════════════════════════
+        // GRAB — pinch to move entire drawing
+        // ═══════════════════════════════════════════════
+        if(gesture==='grab'){
+            if(!wasPinch){
+                grabbing=true;
+                grabAnchorX=x; grabAnchorY=y;
+                grabStartOX=drawOffX; grabStartOY=drawOffY;
+                pushUndo();
+            }
+            if(grabbing){
+                drawOffX=grabStartOX+(x-grabAnchorX);
+                drawOffY=grabStartOY+(y-grabAnchorY);
+                composite();
+                spark(x,y,'#ffe744',1);
+            }
+        } else {
+            if(wasPinch && grabbing){
+                grabbing=false;
+                composite();
+            }
+        }
+
+        wasPinch=pinch;
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // INIT MEDIAPIPE
+    // ═══════════════════════════════════════════════════════
+    $('lstatus').textContent='Loading hand model...';
+    $('lbar').style.width='15%';
+
+    const hands=new Hands({
+        locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+    });
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,      // full model for better tracking
+        minDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.5,
+    });
+    hands.onResults(onResults);
+
+    $('lstatus').textContent='Starting camera...';
+    $('lbar').style.width='40%';
+
+    const camera=new Camera(cam,{
+        onFrame: async()=>{ await hands.send({image:cam}); },
+        width: 640,
+        height: 480,
+    });
+
+    camera.start().then(()=>{
+        $('lstatus').textContent='Ready!';
+        $('lbar').style.width='100%';
+        setTimeout(()=>{
+            $('splash').classList.add('gone');
+            setTimeout(()=>$('splash').remove(),500);
+        },400);
+    }).catch(e=>{
+        $('lstatus').textContent='Camera error: '+e.message;
+    });
+
+    // ═══════════════════════════════════════════════════════
+    // UI — minimal controls
+    // ═══════════════════════════════════════════════════════
+    // Colors
+    document.querySelectorAll('.cdot').forEach(d=>{
+        d.style.background = d.dataset.c;
+        d.style.color = d.dataset.c;
+        d.onclick=()=>{
+            document.querySelectorAll('.cdot').forEach(x=>x.classList.remove('on'));
+            d.classList.add('on');
+            color=d.dataset.c;
+        };
+    });
+
+    // Buttons
+    $('btnUndo').onclick=popUndo;
+    $('btnClear').onclick=()=>{
+        pushUndo();
+        offC.clearRect(0,0,W,H);
+        drawOffX=0; drawOffY=0;
+        composite();
+    };
+    $('btnSave').onclick=()=>{
+        const a=document.createElement('a');
+        a.download='air_draw_'+Date.now()+'.png';
+        a.href=dCv.toDataURL();
+        a.click();
+    };
+
+    // Keyboard shortcuts
+    document.onkeydown=e=>{
+        const k=e.key.toLowerCase();
+        if(k==='z') popUndo();
+        else if(k==='c'){pushUndo();offC.clearRect(0,0,W,H);drawOffX=0;drawOffY=0;composite();}
+        else if(k==='s'){e.preventDefault();$('btnSave').click();}
+        else if(k>='1'&&k<='6'){
+            const dots=document.querySelectorAll('.cdot');
+            const i=+k-1;
+            if(i<dots.length){dots.forEach(d=>d.classList.remove('on'));dots[i].classList.add('on');color=dots[i].dataset.c;}
+        }
+    };
+
+})();
+</script>
+</body>
+</html>
